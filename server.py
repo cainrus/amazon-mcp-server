@@ -52,16 +52,33 @@ async def fetch_amazon_page(url: str) -> str:
         response.raise_for_status()
         return response.text
 
+CURRENCY_SYMBOLS = '$€£¥₹₩'
+
 def clean_price(price_text: str) -> str:
-    """Clean and extract price from text"""
+    """Clean and extract price from text, preserving whatever currency Amazon
+    reported instead of assuming USD -- amazon.com itself geolocates by IP and
+    quotes EUR to a European visitor (finding #2512)."""
     if not price_text:
         return "Price not available"
-    
-    # Remove extra whitespace and common price prefixes
-    cleaned = re.sub(r'[^\d.,]', '', price_text.strip())
-    if cleaned:
-        return f"${cleaned}"
-    return "Price not available"
+
+    text = price_text.strip()
+    if not text:
+        return "Price not available"
+
+    amount_match = re.search(r'\d[\d.,]*', text)
+    if not amount_match:
+        return "Price not available"
+    amount = amount_match.group(0)
+
+    symbol_match = re.search(f'[{CURRENCY_SYMBOLS}]', text)
+    if symbol_match:
+        return f"{symbol_match.group(0)}{amount}"
+
+    code_match = re.search(r'\b[A-Z]{3}\b', text)
+    if code_match:
+        return f"{code_match.group(0)} {amount}"
+
+    return amount
 
 def extract_product_data(html_content: str, url: str) -> dict:
     """Extract product information from Amazon page HTML"""
