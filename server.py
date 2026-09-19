@@ -1,6 +1,7 @@
 # This is amazon products scraper mcp server
 # Build a scraper that can scrape amazon products
 # The scraper should be able to scrape the product name, price, and image
+import asyncio
 import httpx
 from mcp.server.fastmcp import FastMCP
 import re
@@ -36,8 +37,26 @@ mcp = FastMCP(
 BASE_URL = "https://www.amazon.com"
 
 # Helper functions
-async def fetch_amazon_page(url: str) -> str:
-    """Helper function to fetch Amazon product page"""
+
+class AmazonBlockedError(Exception):
+    """Amazon answered with a bot-mitigation challenge instead of the page."""
+
+
+def is_bot_challenge(html: str) -> bool:
+    """True if `html` is an Akamai interstitial challenge, not real content.
+
+    Without this check, a temporary bot challenge and a genuine zero-result
+    search both surface as "No products found" -- indistinguishable, and
+    silently wrong (finding #2514). This is detection only: it does not
+    attempt to solve the challenge or otherwise defeat the bot mitigation.
+    """
+    markers = ('bm-verify', 'triggerInterstitialChallenge', 'validateCaptcha')
+    return any(marker in html for marker in markers)
+
+
+async def fetch_amazon_page(url: str, retries: int = 1) -> str:
+    """Fetch an Amazon page, retrying once if Amazon answers with a bot
+    challenge -- this has been observed to be transient (finding #2514)."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -46,11 +65,22 @@ async def fetch_amazon_page(url: str) -> str:
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
     }
-    
+
     async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers, timeout=15.0)
-        response.raise_for_status()
-        return response.text
+        for attempt in range(retries + 1):
+            response = await client.get(url, headers=headers, timeout=15.0)
+            response.raise_for_status()
+            html = response.text
+            if not is_bot_challenge(html):
+                return html
+            if attempt < retries:
+                await asyncio.sleep(2)
+
+    raise AmazonBlockedError(
+        "Amazon ответил анти-бот проверкой (JS-челлендж, не картиночная капча) "
+        "вместо страницы — это не пустая выдача, попробуйте запрос ещё раз "
+        "через минуту-другую."
+    )
 
 CURRENCY_SYMBOLS = '$€£¥₹₩'
 
@@ -74,7 +104,10 @@ def clean_price(price_text: str) -> str:
     if symbol_match:
         return f"{symbol_match.group(0)}{amount}"
 
-    code_match = re.search(r'\b[A-Z]{3}\b', text)
+    # Not \b[A-Z]{3}\b: Amazon runs the code straight into the amount with no
+    # separator ("EUR60.93"), and \b never fires between a letter and a digit
+    # -- both count as "word" characters, so there is no boundary there.
+    code_match = re.search(r'(?<![A-Za-z])[A-Z]{3}(?![A-Za-z])', text)
     if code_match:
         return f"{code_match.group(0)} {amount}"
 
@@ -111,13 +144,17 @@ def extract_product_data(html_content: str, url: str) -> dict:
                 product_data['name'] = name_elem.get_text().strip()
                 break
         
-        # Extract price
+        # Extract price. `.a-offscreen` variants carry the FULL formatted
+        # price (currency + cents, e.g. "$19.99" / "EUR 61.04") and are tried
+        # first; `.a-price-whole` is checked earlier than them because it
+        # matches most often, but it's Amazon's whole-dollar-only display
+        # fragment (no cents, no symbol) so it goes last as a fallback.
         price_selectors = [
-            '.a-price-whole',
             '.a-price .a-offscreen',
             '.a-price-range .a-price-range-min .a-offscreen',
             '.a-price .a-price-symbol + span',
-            '[data-a-color="price"] .a-offscreen'
+            '[data-a-color="price"] .a-offscreen',
+            '.a-price-whole',
         ]
         
         for selector in price_selectors:
@@ -241,8 +278,10 @@ def extract_search_results(html_content: str, max_results: int) -> list:
                         product_url = 'https://www.amazon.com' + product_url
                     product['url'] = product_url
             
-            # Extract price
-            price_elem = container.select_one('.a-price-whole')
+            # Extract price. Same reasoning as extract_product_data: prefer
+            # the full formatted price (`.a-offscreen`) over the whole-dollar
+            # display fragment, which carries neither cents nor currency.
+            price_elem = container.select_one('.a-price .a-offscreen') or container.select_one('.a-price-whole')
             if price_elem:
                 product['price'] = clean_price(price_elem.get_text())
             
