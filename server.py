@@ -3,10 +3,11 @@
 # The scraper should be able to scrape the product name, price, and image
 import asyncio
 import httpx
+import os
 from mcp.server.fastmcp import FastMCP
 import re
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 # Create a Trello MCP server
 mcp = FastMCP(
@@ -35,6 +36,129 @@ mcp = FastMCP(
 # API_KEY = os.getenv("TRELLO_API_KEY")
 # API_TOKEN = os.getenv("TRELLO_API_TOKEN")
 BASE_URL = "https://www.amazon.com"
+
+# Amazon's storefronts do NOT share a catalogue. A European brand can be absent
+# from .com entirely, and the search then answers with unrelated products rather
+# than an empty result -- so the domain is a correctness knob, not a preference
+# (finding #2529).
+DEFAULT_DOMAIN = "com"
+# Suffix only: letters and dots, 2..6 chars ("com", "de", "co.uk", "com.br").
+_DOMAIN_SUFFIX_RE = re.compile(r'^[a-z]{2,3}(\.[a-z]{2,3})?$')
+
+
+def resolve_domain(domain: str | None = None) -> str:
+    """Turn a domain hint into an Amazon base URL.
+
+    Accepts "de", "amazon.de", "www.amazon.de" or a full URL; falls back to
+    $AMAZON_DOMAIN and then to .com. Only ever returns an amazon.<suffix> host:
+    the suffix is validated and the URL rebuilt from scratch, so a hostile
+    value cannot point the fetcher at an unrelated host.
+    """
+    raw = (domain or os.environ.get("AMAZON_DOMAIN") or DEFAULT_DOMAIN).strip().lower()
+
+    # Strip scheme and path, keeping only the host. A path is tolerated only
+    # when it is empty ("https://www.amazon.de/"): anything else is a sign the
+    # caller meant something we would have to guess at, and guessing is how a
+    # wrong storefront gets used silently.
+    if "//" in raw:
+        parsed = urlparse(raw)
+        if parsed.path not in ("", "/") or parsed.query or parsed.params:
+            raise ValueError(f"Pass a domain, not a URL with a path: {domain!r}")
+        raw = parsed.netloc or ""
+    elif "/" in raw:
+        host, _, rest = raw.partition("/")
+        if rest:
+            raise ValueError(f"Pass a domain, not a path: {domain!r}")
+        raw = host
+    raw = raw.strip().rstrip(".")
+
+    if raw.startswith("www."):
+        raw = raw[4:]
+    if raw.startswith("amazon."):
+        suffix = raw[len("amazon."):]
+    elif "." in raw and not _DOMAIN_SUFFIX_RE.match(raw):
+        # Something like "evil.com" -- a host, but not Amazon's.
+        raise ValueError(f"Not an Amazon domain: {domain!r}")
+    else:
+        suffix = raw
+
+    if not _DOMAIN_SUFFIX_RE.match(suffix):
+        raise ValueError(
+            f"Unsupported Amazon domain {domain!r}. Pass a suffix like "
+            f"'com', 'de' or 'co.uk'."
+        )
+
+    return f"https://www.amazon.{suffix}"
+
+
+def build_search_url(query: str, base_url: str) -> str:
+    """Search URL for `query` on the given storefront."""
+    return f"{base_url}/s?k={quote_plus(query)}"
+
+
+_TOKEN_RE = re.compile(r'[a-z0-9]+')
+
+
+def _tokens(text: str) -> set:
+    """Comparable tokens: lowercase alphanumerics of 2+ chars.
+
+    Two chars, not three, because model numbers matter here -- "4G" and "X6"
+    are exactly the tokens that separate the product asked for from a lookalike.
+    """
+    return {t for t in _TOKEN_RE.findall(text.lower()) if len(t) >= 2}
+
+
+# Words that mark a listing as something you put ON a device, not the device.
+# An accessory repeats the product's full name ("screen protector for Elari
+# KidPhone 4G"), so it scores a perfect match while the device itself may be
+# absent from the results entirely.
+_ACCESSORY_RE = re.compile(
+    r'\b('
+    r'case|cover|protector|protectors|screen guard|tempered glass|glass film|'
+    r'film|skin|sleeve|pouch|holster|strap|straps|band|bands|wristband|'
+    r'charger|charging cable|cable|adapter|dock|stand|mount|lanyard|'
+    r'h[üu]lle|schutzfolie|schutzglas|panzerglas|displayschutz|armband|tasche|'
+    r'ladeger[äa]t|ladekabel'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def looks_like_accessory(name: str) -> bool:
+    """True if the listing name reads like an accessory rather than a device."""
+    return bool(_ACCESSORY_RE.search(name or ""))
+
+
+def best_matching_product(query: str, products: list) -> dict | None:
+    """The single result that covers most of the query's tokens."""
+    wanted = _tokens(query)
+    if not wanted or not products:
+        return None
+
+    return max(
+        products,
+        key=lambda p: len(wanted & _tokens(p.get("name") or "")),
+        default=None,
+    )
+
+
+def best_query_coverage(query: str, products: list) -> float:
+    """Largest share of the query's tokens covered by any single result name.
+
+    1.0 means some result contains every word of the query; 0.0 means no result
+    contains any of them -- which is what a substituted search looks like.
+    """
+    wanted = _tokens(query)
+    if not wanted or not products:
+        return 0.0
+
+    best = 0.0
+    for product in products:
+        name = product.get("name") or ""
+        hits = len(wanted & _tokens(name))
+        best = max(best, hits / len(wanted))
+    return best
+
 
 # Helper functions
 
@@ -246,8 +370,12 @@ def extract_product_data(html_content: str, url: str) -> dict:
 
 # Helper functions for search results
 
-def extract_search_results(html_content: str, max_results: int) -> list:
-    """Extract product information from Amazon search results"""
+def extract_search_results(html_content: str, max_results: int, base_url: str = BASE_URL) -> list:
+    """Extract product information from Amazon search results.
+
+    `base_url` is the storefront the HTML came from: relative links must be
+    resolved against it, or a .de result gets a .com URL that may 404.
+    """
     soup = BeautifulSoup(html_content, 'html.parser')
     products = []
     
@@ -275,7 +403,7 @@ def extract_search_results(html_content: str, max_results: int) -> list:
                 product_url = url_elem.get('href')
                 if product_url:
                     if product_url.startswith('/'):
-                        product_url = 'https://www.amazon.com' + product_url
+                        product_url = base_url + product_url
                     product['url'] = product_url
             
             # Extract price. Same reasoning as extract_product_data: prefer
@@ -315,12 +443,44 @@ def format_search_results(products: list, query: str) -> str:
         return f"No products found for '{query}'"
     
     result = f"# Search Results for '{query}'\n\n"
+
+    # Amazon answers a query it has no match for with loosely related products
+    # instead of nothing. The caller reads only this text, so the mismatch has
+    # to be stated in it -- otherwise five plausible rows read as five hits
+    # (finding #2529).
+    coverage = best_query_coverage(query, products)
+    if coverage == 0.0:
+        result += (
+            f"⚠️ ВНИМАНИЕ: ни один результат НЕ содержит слов запроса "
+            f"'{query}'. Amazon подставил похожие товары вместо искомого — "
+            f"скорее всего, на этой витрине его нет. Проверьте другой домен "
+            f"(параметр domain, например 'de') прежде чем считать это ценами "
+            f"на запрошенный товар.\n\n"
+        )
+    elif coverage < 1.0:
+        result += (
+            f"ℹ️ Точного совпадения нет: лучшее частичное покрытие запроса — "
+            f"{coverage:.0%}. Сверьте названия ниже с тем, что искали.\n\n"
+        )
+
+    # A full-coverage hit can still be the wrong kind of thing: accessories
+    # quote the device's whole name. Only worth saying when the caller did not
+    # ask for an accessory in the first place.
+    best = best_matching_product(query, products)
+    if best is not None and not looks_like_accessory(query):
+        if looks_like_accessory(best.get("name") or ""):
+            result += (
+                "⚠️ Лучшее совпадение похоже на АКСЕССУАР (чехол, плёнка, "
+                "ремешок), а не на само устройство — возможно, товара на этой "
+                "витрине нет, а совпали слова из названия аксессуара.\n\n"
+            )
+
     for i, product in enumerate(products):
         result += f"## {i+1}. {product['name']}\n"
         result += f"Price: {product['price']}\n"
         result += f"Rating: {product['rating']}\n"
         result += f"URL: {product['url']}\n\n"
-    
+
     return result
 
 def format_product_details(product: dict) -> str:
@@ -363,21 +523,35 @@ async def scrape_product(product_url: str) -> str:
         return f"Error scraping product: {str(e)}"
 
 @mcp.tool()
-async def search_products(query: str, max_results: int = 5) -> str:
-    """Search for products on Amazon and return results"""
+async def search_products(query: str, max_results: int = 5, domain: str | None = None) -> str:
+    """Search for products on Amazon and return results.
+
+    Args:
+        query: what to search for.
+        max_results: how many results to return.
+        domain: which Amazon storefront to search -- "com" (default), "de",
+            "co.uk", "fr" and so on. Storefronts carry DIFFERENT catalogues:
+            a European product missing from .com will come back as unrelated
+            lookalikes there and as the real thing on .de. Defaults to
+            $AMAZON_DOMAIN, then "com".
+    """
     try:
-        # Construct search URL
-        search_url = f"https://www.amazon.com/s?k={query.replace(' ', '+')}"
-        
+        base_url = resolve_domain(domain)
+        search_url = build_search_url(query, base_url)
+
         # Fetch search results page
         html_content = await fetch_amazon_page(search_url)
-        
+
         # Extract search results
-        products = extract_search_results(html_content, max_results)
-        
+        products = extract_search_results(html_content, max_results, base_url=base_url)
+
         # Format the results
         return format_search_results(products, query)
-        
+
+    except ValueError as e:
+        return f"Error: {str(e)}"
+    except AmazonBlockedError as e:
+        return f"Error: {str(e)}"
     except Exception as e:
         return f"Error searching products: {str(e)}"
 
